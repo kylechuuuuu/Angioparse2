@@ -12,20 +12,3 @@ The same codebase supports two tasks:
 * **det-only** — the no-mask case: trains and runs with **no masks directory at all**. The
   det-only v2 code (box-supervised dense lesion prior + copy-paste augmentation) lives in
   [`detonly/`](detonly/README.md); copy its files over this tree to switch variant.
-
-## Citation
-
-If you use this code, please cite:
-
-```bibtex
-@InProceedings{ZhuKai_FineGrained_MICCAI2026,
-    author = { Zhu, Kai AND Cao, Le AND Chen, Li AND Cheng, Jun AND Mou, Lei AND Zhao, Yitian},
-    title = { { Fine-Grained Cerebrovascular Parsing in DSA via Structurally-Grounded Semantic Disentanglement } },
-    booktitle = {Medical Image Computing and Computer Assisted Intervention -- MICCAI 2026},
-    year = {2026},
-    publisher = {Springer Nature Switzerland},
-    volume = {LNCS 16893},
-    month = {September},
-    page = {pending}
-}
-```
