@@ -87,6 +87,9 @@ def forward_with_tta(model, image, new_w, new_h, pad_l, pad_t, orig_w, orig_h, t
     un-flipped back — which reliably buys +0.5-1pt Dice on thin vessels.
     Detection always uses the ORIGINAL pass only (flipped heatmap peaks would
     need box re-transforming for no expected gain).
+
+    Returns (pred_boxes, pred_logits, seg_probs); seg_probs is None when the
+    model has no segmentation branch (detection-only checkpoint).
     """
     def seg_probs(seg_out):
         # Clamp the crop to the canvas. With the zoom augmentation (scale > 1)
@@ -103,6 +106,11 @@ def forward_with_tta(model, image, new_w, new_h, pad_l, pad_t, orig_w, orig_h, t
         return torch.softmax(seg_out, dim=1)
 
     output, pred_boxes, pred_logits, det_outputs, *_ = model(image)
+    if output is None:
+        # Detection-only model (task='det'): there are no seg logits to
+        # un-letterbox, and the flip TTA below only averages segmentation
+        # probabilities, so the extra forwards would be pure cost.
+        return pred_boxes, pred_logits, None
     seg_out = output[-1] if isinstance(output, list) else output
     probs = seg_probs(seg_out)
 
@@ -187,6 +195,53 @@ def apply_checkpoint_arch(ckpt_path):
         if arch.get(key) is not None and os.environ.get(env_name) is None:
             os.environ[env_name] = str(arch[key])
 
+    # seg_prior changes the det stem's input width, so a mismatch is fatal
+    # (load_state_dict raises on the shape, strict=False does not help) -- the
+    # checkpoint wins and an explicit conflicting env setting is reported.
+    if arch.get('seg_prior') is not None:
+        want = '1' if arch['seg_prior'] else '0'
+        cur = (os.environ.get('SD2_SEG_PRIOR') or '').strip().lower()
+        if cur and cur != 'auto' and cur != want:
+            print(f"  Warning: SD2_SEG_PRIOR={cur} but the checkpoint was built "
+                  f"with {want}; using {want}")
+        os.environ['SD2_SEG_PRIOR'] = want
+        print(f"  (architecture from checkpoint sidecar: SD2_SEG_PRIOR={want})")
+
+    if arch.get('task'):
+        cur = (os.environ.get('SD2_TASK') or '').strip().lower()
+        if cur and cur != 'auto' and cur != arch['task']:
+            print(f"  Warning: SD2_TASK={cur} but the checkpoint was trained "
+                  f"with {arch['task']}; using {arch['task']}")
+        os.environ['SD2_TASK'] = arch['task']
+        print(f"  (architecture from checkpoint sidecar: SD2_TASK={arch['task']})")
+
+    # bank_deep_layers decides, per layer, whether the MLP is an AdapterBank
+    # (router + 6 structure adapters) or a plain MLPAdapter: a mismatched count
+    # leaves those keys missing/unexpected, so strict=False keeps random
+    # adapters and the structure routing silently does nothing.
+    if arch.get('bank_deep_layers') is not None:
+        n = int(arch['bank_deep_layers'])
+        want = 'all' if n < 0 else str(n)
+        cur = (os.environ.get('SD2_BANK_LAYERS') or '').strip().lower()
+        if cur and cur != want:
+            print(f"  Warning: SD2_BANK_LAYERS={cur} but the checkpoint was built "
+                  f"with {want}; using {want}")
+        os.environ['SD2_BANK_LAYERS'] = want
+        print(f"  (architecture from checkpoint sidecar: SD2_BANK_LAYERS={want})")
+
+    # The refiner variant decides which refiner keys exist. Loading a 'legacy'
+    # checkpoint into a deeper refiner (or vice versa) leaves the refiner
+    # randomly initialised -- and since the refiner's output head is
+    # zero-initialised, the refinement then silently becomes a no-op instead of
+    # raising. A sidecar written before the knob existed means 'legacy'.
+    want = arch.get('refiner', 'legacy')
+    cur = (os.environ.get('SD2_REFINER') or '').strip().lower()
+    if cur and cur != want:
+        print(f"  Warning: SD2_REFINER={cur} but the checkpoint was built "
+              f"with {want}; using {want}")
+    os.environ['SD2_REFINER'] = want
+    print(f"  (architecture from checkpoint sidecar: SD2_REFINER={want})")
+
 
 def test(model=None, compute_metrics=False):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -204,8 +259,6 @@ def test(model=None, compute_metrics=False):
         'cerebral': os.path.join(output_base_dir, 'cerebral'),
         'det': os.path.join(output_base_dir, 'det'),
     }
-    for d in dirs.values():
-        os.makedirs(d, exist_ok=True)
 
     if model is None:
         print("Initializing model and loading weights...")
@@ -239,6 +292,16 @@ def test(model=None, compute_metrics=False):
     val_dataset = VesselDataset(data_root, split='val')
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=4, persistent_workers=True)
 
+    # Segmentation is written/scored only when both a seg branch and GT masks
+    # exist; a detection-only run produces the det/ overlays alone.
+    score_seg = val_dataset.has_masks and getattr(model, 'seg_enabled', True)
+    if not score_seg:
+        print(f"Segmentation skipped (masks on disk: {val_dataset.has_masks}, "
+              f"model task: {getattr(model, 'task', 'joint')}): writing det/ only.")
+    for name, d in dirs.items():
+        if score_seg or name == 'det':
+            os.makedirs(d, exist_ok=True)
+
     with torch.no_grad():
         for i, (image, masks_dict, det_dict, img_name) in enumerate(tqdm(val_loader)):
             image = image.to(device)
@@ -258,18 +321,19 @@ def test(model=None, compute_metrics=False):
             pad_t = int(meta['pad_t'][0])
             pred_boxes, pred_logits, seg_probs = forward_with_tta(
                 model, image, new_w, new_h, pad_l, pad_t, orig_w, orig_h, tta=tta)
-            pred = torch.argmax(seg_probs, dim=1)
 
-            pred_np = pred[0].cpu().numpy().astype(np.int64)
+            if seg_probs is not None:
+                pred = torch.argmax(seg_probs, dim=1)
+                pred_np = pred[0].cpu().numpy().astype(np.int64)
 
-            pred_rgb_overall = decode_mask(pred_np, val_dataset.colors)
-            vutils.save_image(pred_rgb_overall, os.path.join(dirs['overall'], save_name))
+                pred_rgb_overall = decode_mask(pred_np, val_dataset.colors)
+                vutils.save_image(pred_rgb_overall, os.path.join(dirs['overall'], save_name))
 
-            pred_rgb_main = decode_mask(pred_np, val_dataset.colors, selected_ids=[2, 3])
-            vutils.save_image(pred_rgb_main, os.path.join(dirs['main'], save_name))
+                pred_rgb_main = decode_mask(pred_np, val_dataset.colors, selected_ids=[2, 3])
+                vutils.save_image(pred_rgb_main, os.path.join(dirs['main'], save_name))
 
-            pred_rgb_cerebral = decode_mask(pred_np, val_dataset.colors, selected_ids=[4, 5, 6])
-            vutils.save_image(pred_rgb_cerebral, os.path.join(dirs['cerebral'], save_name))
+                pred_rgb_cerebral = decode_mask(pred_np, val_dataset.colors, selected_ids=[4, 5, 6])
+                vutils.save_image(pred_rgb_cerebral, os.path.join(dirs['cerebral'], save_name))
 
             det_img = Image.open(img_path).convert('RGB')
             # Boxes are in padded-canvas space; map back to the original image.
@@ -289,11 +353,14 @@ def test(model=None, compute_metrics=False):
 
     if compute_metrics:
         print("\nCalculating metrics...")
-        eval_results = run_eval(
-            pred_dir=dirs['overall'],
-            gt_dir=os.path.join(data_root, 'val', 'masks'),
-            label_path=os.path.join(data_root, 'label.json')
-        )
+        if score_seg:
+            eval_results = run_eval(
+                pred_dir=dirs['overall'],
+                gt_dir=os.path.join(data_root, 'val', 'masks'),
+                label_path=os.path.join(data_root, 'label.json')
+            )
+        else:
+            print("Segmentation metrics skipped (no masks / detection-only model).")
         det_results = evaluate_detection(model, data_root=data_root, split='val')
 
         if det_results:

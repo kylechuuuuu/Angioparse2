@@ -9,8 +9,9 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from fusionet2 import (FusionModel, resolve_det_grad_scale, resolve_offset_scale,
-                       resolve_dilations, resolve_size_prior, resolve_arch_config)
-from dataset import VesselDataset, COLOR_TO_ID
+                       resolve_dilations, resolve_size_prior, resolve_arch_config,
+                       resolve_seg_prior, resolve_task)
+from dataset import VesselDataset, COLOR_TO_ID, has_masks
 from calculate_metrics import calculate_metrics as run_eval
 import numpy as np
 import random
@@ -32,12 +33,14 @@ def _env_float(name, default):
 
 NUM_CLASSES = 7
 NUM_EPOCHS = _env_int('SD2_EPOCHS', 220)   # was 350; seg peaked ~ep130 and overfit after
-# Optional early stop: stop after this epoch (1-based) while keeping the
-# NUM_EPOCHS-length LR/consistency schedules, so val metrics match a full run.
-# 0 disables. Logs show best val checkpoints land well before epoch 150.
-STOP_EPOCH = _env_int('SD2_STOP_EPOCH', 0)
 LR = _env_float('SD2_LR', 1e-4)
 ADAPTER_LR_MULT = _env_float('SD2_ADAPTER_LR_MULT', 5.0)
+# AMP 精度选择。默认 fp16，与改动前逐位一致；未知取值也退回 fp16。
+# 数据量大的检测子集（huaxi2, 1349 图）上 fp16 会在 ~ep20 触发溢出型 NaN 级联
+# （fp16 上限 65504），这时可用 SD2_AMP_DTYPE=bf16 —— bf16 指数范围与 fp32 相同，
+# 不会溢出；fp32 则彻底关闭 autocast。
+_AMP_NAME = os.environ.get('SD2_AMP_DTYPE', 'fp16').lower()
+AMP_DTYPE = {'fp16': torch.float16, 'bf16': torch.bfloat16, 'fp32': None}.get(_AMP_NAME, torch.float16)
 WEIGHT_DECAY = 5e-3
 NUM_WORKERS = _env_int('SD2_WORKERS', 8)
 VAL_EVERY = _env_int('SD2_VAL_EVERY', 5)
@@ -47,10 +50,27 @@ SAVE_VIZ = _env_int('SD2_SAVE_VIZ', 0) == 1       # save PNG viz during training
 OUT_PREFIX = os.environ.get('SD2_OUT_PREFIX', 'best_fusion_model')
 LOG_FILE = os.environ.get('SD2_LOG', 'train.log')
 
-FG_WEIGHT = 0.3
+FG_WEIGHT = _env_float('SD2_FG_WEIGHT', 0.3)        # ablation axis: foreground-BCE weight
 CONSIST_W0 = _env_float('SD2_CONSIST_W0', 0.5)    # consistency weight at epoch 0
 CONSIST_W1 = _env_float('SD2_CONSIST_W1', 0.15)   # consistency weight at final epoch
-ROUTER_WEIGHT = 0.1
+ROUTER_WEIGHT = _env_float('SD2_ROUTER_WEIGHT', 0.1)  # ablation axis: router presence-loss weight
+# Switch-style load balance on the router weights: minimised when each structure
+# adapter's mean weight matches its class demand share, so nothing lets one slot
+# own the softmax (see FusionModel.router_balance_loss).
+ROUTER_BAL_WEIGHT = _env_float('SD2_ROUTER_BAL_W', 0.01)
+# Early stopping: halt when the monitored validation metric has not improved for
+# SD2_EARLY_STOP epochs (0 = disabled, run all NUM_EPOCHS). SD2_STOP_METRIC picks
+# the metric: 'dice' (Mean Dice FG, default), 'ap50' (rolling-median AP50) or
+# 'joint' (0.5*dice + 0.5*ap50). The patience is counted in EPOCHS, and the
+# val split is only scored every VAL_EVERY epochs, so a check that does not
+# improve advances the counter by VAL_EVERY. SD2_TAG only labels the result JSON.
+EARLY_STOP = _env_int('SD2_EARLY_STOP', 0)
+STOP_METRIC = (os.environ.get('SD2_STOP_METRIC') or 'dice').strip().lower()
+RUN_TAG = os.environ.get('SD2_TAG', '')
+# Penalty on the refiner's own |delta| (0 = off). The measured legacy correction
+# was a +-1.9 logit self-confirmation that never improved the training objective
+# (probe_refiner_information.py); this term makes 'do nothing' the default so a
+# correction has to earn more than its own magnitude.
 # Detection weight for the balanced focal + dense-L1 + GIoU loss. GT is sparse
 # (68 boxes over 175 train images), but the balanced loss keeps positive
 # signal dominant, so 1.0 is safe; tune via SD2_DET_WEIGHT.
@@ -84,11 +104,17 @@ SIZE_L1_WEIGHT = _env_float('SD2_SIZE_L1_W', 5.0)
 # Extra sampler weight for images that carry a detection GT box. Only 67/175
 # train images have boxes, so the detector is starved relative to the seg task.
 DET_SAMPLE_W = _env_float('SD2_DET_SAMPLE_W', 0.5)
+# Same knob for detection-only runs: detection is then the only task, so the
+# 67/175 box images are oversampled harder (they go from ~48% to ~65% of the
+# samples per epoch) instead of sharing the budget with the rare-class term.
+DET_ONLY_SAMPLE_W = _env_float('SD2_DET_ONLY_SAMPLE_W', 3.0)
 # Score threshold used when turning the heatmap into boxes for evaluation.
 # AP50 should ideally rank ALL detections; 0.5 truncates recall at ~0.52.
 EVAL_SCORE = _env_float('SD2_EVAL_SCORE', 0.5)
 
-DATA_ROOT = "DSCA_new"
+# 与 TMI_compare/SD2net 的老版本保持同一约定：可用 SD2_DATA_ROOT 指定数据集根目录。
+# 不设该变量时默认仍是 "DSCA_new"，行为与改动前完全一致。
+DATA_ROOT = os.environ.get('SD2_DATA_ROOT', 'DSCA_new')
 
 
 class DiceLoss(nn.Module):
@@ -157,75 +183,6 @@ class HybridLoss(nn.Module):
         num_nearby_classes = nearby.sum(dim=1)                                 # [B, H, W]
         boundary = (num_nearby_classes > 1.0).float()
         return 1.0 + self.boundary_scale * boundary
-
-
-# ---------------------------------------------------------------------------
-# clDice: topology-preserving loss for tubular structures
-# (Shit et al., "clDice -- a Novel Topology-Preserving Loss Function for
-# Tubular Structure Segmentation", CVPR 2021)
-#
-# Motivation (measured on this dataset): the residual segmentation error is a
-# ~constant 1.4px boundary error, independent of class -- ACA 1.47px, MCA
-# 1.39px, PCA 1.44px, carotid 1.33px. Because the cerebral vessels are only
-# 4.5-5.2px wide, that fixed error costs them ~0.28 Dice each while the thick
-# classes keep 0.91-0.97. Dice/CE penalise every boundary pixel equally, so
-# they give no gradient that specifically pulls a thin vessel onto its
-# centreline. clDice does:
-#   Tprec = |skel(P) & G| / |skel(P)|   predicted centreline must lie inside GT
-#   Tsens = |skel(G) & P| / |skel(G)|   GT centreline must be covered by P
-# Tsens is the term that fattens an under-segmented thin vessel back onto its
-# centreline; Tprec stops it from bleeding.
-# ---------------------------------------------------------------------------
-CLDICE_WEIGHT = _env_float('SD2_CLDICE_W', 0.0)     # 0 = off (v6 behaviour)
-CLDICE_ITER = _env_int('SD2_CLDICE_ITER', 3)        # erosion depth; 3 covers <=7px vessels
-CLDICE_SMOOTH = _env_float('SD2_CLDICE_SMOOTH', 1.0)
-# Structure channels clDice is applied to (0=noise ... 5=PCA, i.e. class i+1).
-# Default: all six. Memory scales with the channel count, and the three
-# cerebral classes (indices 3,4,5 = ACA/MCA/PCA) are the ones the boundary
-# error actually hurts (Dice 0.68-0.72 vs 0.83-0.97 for the thick classes),
-# so SD2_CLDICE_CH=3,4,5 targets the bottleneck at half the memory.
-CLDICE_CH = [int(x) for x in os.environ.get('SD2_CLDICE_CH', '0,1,2,3,4,5').split(',') if x.strip()]
-
-
-def soft_erode(img):
-    p1 = -F.max_pool2d(-img, (3, 1), (1, 1), (1, 0))
-    p2 = -F.max_pool2d(-img, (1, 3), (1, 1), (0, 1))
-    return torch.min(p1, p2)
-
-
-def soft_dilate(img):
-    return F.max_pool2d(img, (3, 3), (1, 1), (1, 1))
-
-
-def soft_open(img):
-    return soft_dilate(soft_erode(img))
-
-
-def soft_skel(img, iters):
-    """Differentiable skeletonisation: iterative erosion minus its own opening."""
-    img1 = soft_open(img)
-    skel = F.relu(img - img1)
-    for _ in range(iters):
-        img = soft_erode(img)
-        img1 = soft_open(img)
-        delta = F.relu(img - img1)
-        skel = skel + F.relu(delta - skel * delta)
-    return skel
-
-
-def soft_cldice_loss(pred_prob, target_prob, iters=3, smooth=1.0):
-    """1 - clDice. Both inputs are [B, K, H, W] soft probabilities in [0, 1]."""
-    skel_pred = soft_skel(pred_prob, iters)
-    with torch.no_grad():
-        # The GT is constant, so its skeleton never needs a backward graph.
-        # Skipping it roughly halves the clDice activation footprint.
-        skel_true = soft_skel(target_prob, iters)
-    # Reductions in fp32: an fp16 accumulator would overflow on 1M-pixel maps.
-    tprec = ((skel_pred * target_prob).sum(dtype=torch.float32) + smooth) / \
-            (skel_pred.sum(dtype=torch.float32) + smooth)
-    tsens = ((skel_true * pred_prob).sum(dtype=torch.float32) + smooth) / \
-            (skel_true.sum(dtype=torch.float32) + smooth)
-    return 1.0 - 2.0 * tprec * tsens / (tprec + tsens + 1e-8)
 
 
 class ModelEMA:
@@ -575,6 +532,10 @@ def run_unified_validation(model, data_root=DATA_ROOT, split='val',
     SD2_TTA=1: averages seg softmax over h/v/hv flips (4 seg forwards per
     image, ~3x slower validation) — usually +0.5-1pt Dice on thin vessels.
     Detection always uses the unflipped pass.
+
+    Returns (eval_results, det_results). eval_results is None when there is no
+    segmentation to score — a detection-only run (model.seg_enabled False) or a
+    val split without GT masks — so callers must not assume Dice is available.
     """
     device = next(model.parameters()).device
     was_training = model.training
@@ -594,7 +555,11 @@ def run_unified_validation(model, data_root=DATA_ROOT, split='val',
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False,
                             num_workers=num_workers, persistent_workers=True)
 
-    if save_viz:
+    # Segmentation is scored only when both sides exist: GT masks on disk AND a
+    # seg branch in the model (a detection-only model emits no seg logits).
+    compute_seg = val_dataset.has_masks and getattr(model, 'seg_enabled', True)
+
+    if save_viz and compute_seg:
         from test import draw_detection_boxes
     from test import forward_with_tta
     from detection_metrics import box_cxcywh_to_xyxy, filter_predictions, canvas_to_orig_boxes
@@ -626,10 +591,11 @@ def run_unified_validation(model, data_root=DATA_ROOT, split='val',
             pad_t = int(meta['pad_t'][0])
             pred_boxes, pred_logits, seg_probs = forward_with_tta(
                 model, image, new_w, new_h, pad_l, pad_t, orig_w, orig_h, tta=tta)
-            pred = torch.argmax(seg_probs, dim=1)
-            pred_np = pred[0].cpu().numpy().astype(np.int64)
+            if compute_seg:
+                pred = torch.argmax(seg_probs, dim=1)
+                pred_np = pred[0].cpu().numpy().astype(np.int64)
 
-            if save_viz:
+            if save_viz and compute_seg:
                 # Save segmentation visualizations
                 seg_colors = val_dataset.colors
                 vutils.save_image(
@@ -642,6 +608,7 @@ def run_unified_validation(model, data_root=DATA_ROOT, split='val',
                     _decode_mask(pred_np, seg_colors, selected_ids=[4, 5, 6]),
                     os.path.join(dirs['cerebral'], img_name))
 
+            if save_viz:
                 # Save detection visualization (map boxes from canvas space back
                 # to the original image before drawing).
                 det_img = Image.open(img_path).convert('RGB')
@@ -651,7 +618,7 @@ def run_unified_validation(model, data_root=DATA_ROOT, split='val',
                     det_img, boxes_orig, pred_logits[0].cpu(),
                     orig_w, orig_h, conf_thresh=EVAL_SCORE, nms_iou_thresh=0.5)
                 det_img.save(os.path.join(dirs['det'], img_name))
-            else:
+            elif compute_seg:
                 # Direct confusion accumulation (equivalent to calculate_metrics
                 # on the saved PNGs, without the disk round-trip).
                 gt_path = os.path.join(val_dataset.masks_dir, img_name)
@@ -692,7 +659,9 @@ def run_unified_validation(model, data_root=DATA_ROOT, split='val',
         predictions, gt_map, total_gt)
 
     # --- Compute segmentation metrics ---
-    if save_viz:
+    if not compute_seg:
+        eval_results = None
+    elif save_viz:
         eval_results = run_eval(
             pred_dir=dirs['overall'],
             gt_dir=os.path.join(data_root, split, 'masks'),
@@ -824,11 +793,26 @@ def compute_class_stats(data_root=DATA_ROOT, split='train', downsample=256):
     the rare-class PRESENCE check runs on the full-resolution mask so thin
     ACA/MCA/PCA vessels (which can vanish entirely at low resolution) are still
     detected for oversampling.
+
+    A detection-only dataset has no masks directory: the CE weights are then
+    inert (unit) because no segmentation loss is computed, and the sampler
+    weights come from the box GT alone. Images are enumerated from
+    {split}/images so the returned weights always line up with the dataset
+    order regardless of which of images/masks is present.
     """
     masks_dir = os.path.join(data_root, split, 'masks')
-    files = sorted([f for f in os.listdir(masks_dir)
+    images_dir = os.path.join(data_root, split, 'images')
+    files = sorted([f for f in os.listdir(images_dir)
                     if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+    has_gt_masks = has_masks(data_root, split)
     counts = np.zeros(NUM_CLASSES, dtype=np.float64)
+    # Per-class presence rate over the train split: a class that is present in
+    # every image carries no routing information, so the router's presence loss
+    # masks it out (SD2_ROUTER_DROP_ALWAYS) instead of letting a saturated logit
+    # "satisfy" it -- that is what collapsed 15/32 banks of the previous
+    # all-bank run onto the always-present class.
+    presence_hits = np.zeros(NUM_CLASSES, dtype=np.float64)
+    n_masked = 0
     rare_present = np.zeros(len(files))
     # Oversample images that carry detection GT: the detection task only has
     # 68 boxes over 175 images, so box images get an extra sampling weight.
@@ -836,17 +820,25 @@ def compute_class_stats(data_root=DATA_ROOT, split='train', downsample=256):
     det_ann_dir = os.path.join(data_root, split + '_detect', 'annotations')
     rare_colors = [(255, 242, 0), (200, 191, 231), (239, 228, 176)]  # classes 4,5,6
     for i, f in enumerate(files):
-        with Image.open(os.path.join(masks_dir, f)) as pil:
-            full = pil.convert('RGB')
-            # NEAREST keeps exact label colors (bilinear would blend them away).
-            m = np.array(full.resize((downsample, downsample), Image.NEAREST))
-            # Full-resolution array for the rare-class presence check.
-            full_arr = np.array(full)
-        for (r, g, b), cid in COLOR_TO_ID.items():
-            counts[cid] += np.all(m == np.array((r, g, b)), axis=-1).sum()
-        for c in rare_colors:
-            if np.all(full_arr == np.array(c), axis=-1).any():
-                rare_present[i] += 1
+        # Per-file check, not just the directory: the dataset itself falls back
+        # to an all-background mask for an individual missing file, so a
+        # partially masked dataset must not raise here either.
+        mask_path = os.path.join(masks_dir, f)
+        if os.path.exists(mask_path):
+            with Image.open(mask_path) as pil:
+                full = pil.convert('RGB')
+                # NEAREST keeps exact label colors (bilinear would blend them away).
+                m = np.array(full.resize((downsample, downsample), Image.NEAREST))
+                # Full-resolution array for the rare-class presence check.
+                full_arr = np.array(full)
+            for (r, g, b), cid in COLOR_TO_ID.items():
+                counts[cid] += np.all(m == np.array((r, g, b)), axis=-1).sum()
+                if np.all(full_arr == np.array((r, g, b)), axis=-1).any():
+                    presence_hits[cid] += 1
+            n_masked += 1
+            for c in rare_colors:
+                if np.all(full_arr == np.array(c), axis=-1).any():
+                    rare_present[i] += 1
         base, _ = os.path.splitext(f)
         ann_path = os.path.join(det_ann_dir, base + '.json')
         if os.path.exists(ann_path):
@@ -854,16 +846,33 @@ def compute_class_stats(data_root=DATA_ROOT, split='train', downsample=256):
                 if json.load(fp).get('annotations'):
                     has_det_box[i] = 1
 
-    freq = counts[1:] / max(counts[1:].sum(), 1.0)
-    ce_w = np.ones(NUM_CLASSES, dtype=np.float32)
-    ce_w[1:] = np.clip(1.0 / np.sqrt(freq + 1e-6), 1.0, 8.0)
-    # Moderate oversampling: 1 + 0.75 per cerebral class present (max 3.25),
-    # plus an extra weight for detection-GT images. Only 67/175 train images
-    # carry a box, so without this the detector sees ~46 box images per epoch.
-    sample_w = 1.0 + 0.75 * rare_present + DET_SAMPLE_W * has_det_box
-    logging.getLogger(__name__).info(
-        f"Class pixel freq (FG): {np.round(freq, 4).tolist()} | CE weights: {np.round(ce_w, 3).tolist()}")
-    return torch.tensor(ce_w, dtype=torch.float32), torch.tensor(sample_w, dtype=torch.float64)
+    if has_gt_masks:
+        freq = counts[1:] / max(counts[1:].sum(), 1.0)
+        ce_w = np.ones(NUM_CLASSES, dtype=np.float32)
+        ce_w[1:] = np.clip(1.0 / np.sqrt(freq + 1e-6), 1.0, 8.0)
+        # Moderate oversampling: 1 + 0.75 per cerebral class present (max 3.25),
+        # plus an extra weight for detection-GT images. Only 67/175 train images
+        # carry a box, so without this the detector sees ~46 box images per epoch.
+        sample_w = 1.0 + 0.75 * rare_present + DET_SAMPLE_W * has_det_box
+        logging.getLogger(__name__).info(
+            f"Class pixel freq (FG): {np.round(freq, 4).tolist()} | CE weights: {np.round(ce_w, 3).tolist()}")
+    else:
+        # Detection-only: no seg loss consumes the CE weights, and the only
+        # sampling signal is whether an image has a box.
+        ce_w = np.ones(NUM_CLASSES, dtype=np.float32)
+        sample_w = 1.0 + DET_ONLY_SAMPLE_W * has_det_box
+        logging.getLogger(__name__).info(
+            f"No masks under {masks_dir}: detection-only run, CE weights inert, "
+            f"sampler weight = 1 + {DET_ONLY_SAMPLE_W} * has_box "
+            f"({int(has_det_box.sum())}/{len(files)} images have box GT)")
+    presence_rate = presence_hits / max(n_masked, 1)
+    if has_gt_masks:
+        logging.getLogger(__name__).info(
+            "Class presence rate (train): " +
+            ", ".join(f"{c}:{presence_rate[c]:.3f}" for c in range(1, NUM_CLASSES)))
+    return (torch.tensor(ce_w, dtype=torch.float32),
+            torch.tensor(sample_w, dtype=torch.float64),
+            presence_rate)
 
 
 def save_checkpoint(model, path):
@@ -890,7 +899,12 @@ def save_checkpoint(model, path):
     # garbage. test.py reads this back to rebuild the same architecture.
     try:
         with open(path + '.arch.json', 'w') as fp:
-            json.dump(resolve_arch_config(), fp, indent=2)
+            json.dump(resolve_arch_config(
+                seg_prior=getattr(model, 'use_seg_prior', None),
+                task=getattr(model, 'task', None),
+                bank_deep_layers=getattr(model, 'bank_deep_layers', None),
+                refiner=getattr(model, 'refiner_variant', None),
+                ), fp, indent=2)
     except OSError:
         pass
 
@@ -905,12 +919,13 @@ def backup_existing_checkpoints(prefix, logger):
     present = [t for t in targets if os.path.exists(t)]
     if not present:
         return
-    dest_dir = os.path.join('_ckpt_backup', f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}")
+    dest_dir = os.path.join('_ckpt_backup',
+                            f"{prefix.replace(os.sep, '_')}_{time.strftime('%Y%m%d_%H%M%S')}")
     os.makedirs(dest_dir, exist_ok=True)
     for t in present:
-        # basename: `t` already carries the prefix's directory components, and
-        # dest_dir embeds the prefix too, so joining `t` verbatim would nest
-        # another uncreated copy of that path inside dest_dir.
+        # basename, not t: t can be absolute or contain directories (a custom
+        # SD2_OUT_PREFIX), and joining it onto dest_dir would either copy the
+        # file onto itself or into a non-existent nested path.
         shutil.copy2(t, os.path.join(dest_dir, os.path.basename(t)))
     logger.info(f"Backed up existing checkpoints {present} -> {dest_dir}/")
 
@@ -952,32 +967,57 @@ def train():
 
     logger.info("=" * 80)
     logger.info(f"Training config: epochs={NUM_EPOCHS} lr={LR} adapter_lr_mult={ADAPTER_LR_MULT} "
+                f"amp={_AMP_NAME} "
                 f"ema={EMA_DECAY} iterations={NUM_ITERATIONS} workers={NUM_WORKERS} "
                 f"consist={CONSIST_W0}->{CONSIST_W1} det_w={DET_WEIGHT} "
                 f"det_neg_topk={DET_NEG_K}@{DET_NEG_WEIGHT} "
                 f"det_grad_scale={resolve_det_grad_scale()} save_viz={SAVE_VIZ} "
                 f"offset_scale={resolve_offset_scale()} size_l1_w={SIZE_L1_WEIGHT} "
                 f"neg_floor={NEG_FLOOR} det_sample_w={DET_SAMPLE_W} "
-                f"eval_score={EVAL_SCORE} stop_epoch={STOP_EPOCH} seed={seed} "
-                f"cldice_w={CLDICE_WEIGHT}@{CLDICE_ITER} ch={CLDICE_CH}")
-    # Architecture knobs that change parameter SHAPES must be logged: without
-    # them the run cannot be reproduced from the log (and a checkpoint saved
-    # with a different value loads silently into a wrong architecture).
-    logger.info(f"Architecture: {resolve_arch_config()}")
+                f"eval_score={EVAL_SCORE} seed={seed} "
+                f"fg_w={FG_WEIGHT} rtr_w={ROUTER_WEIGHT} rtr_bal_w={ROUTER_BAL_WEIGHT} "
+                f"early_stop={EARLY_STOP}/{STOP_METRIC} tag={RUN_TAG or '-'}")
     backup_existing_checkpoints(OUT_PREFIX, logger)
 
+    # Dataset first: whether {split}/masks exists decides both which branches
+    # the model runs (resolve_task) and whether the det head may consume the
+    # class-1 seg prior (resolve_seg_prior). Without masks there is no
+    # segmentation supervision, so the prior would be an untrained head's output
+    # and the seg/consistency losses would have no target.
+    logger.info("Loading data...")
+    train_dataset = VesselDataset(data_root, split="train", augment=True, max_det_targets=10)
+    has_gt_masks = train_dataset.has_masks
+    task = resolve_task(has_gt_masks)
+    use_seg_prior = resolve_seg_prior(has_gt_masks)
+
     logger.info("Computing class statistics (weights + oversampling)...")
-    ce_weights, sample_weights = compute_class_stats(data_root, split='train')
+    ce_weights, sample_weights, class_presence = compute_class_stats(data_root, split='train')
 
     logger.info("Initializing model...")
-    model = FusionModel(num_classes=NUM_CLASSES, num_iterations=NUM_ITERATIONS)
+    model = FusionModel(num_classes=NUM_CLASSES, num_iterations=NUM_ITERATIONS,
+                        task=task, use_seg_prior=use_seg_prior)
     model = model.to(device)
+    # Per-class train presence rate: classes present in (almost) every image are
+    # masked out of the router presence target when SD2_ROUTER_DROP_ALWAYS > 0.
+    model.class_presence = class_presence
     # The detection loss must decode the regression with the same offset range
     # the head uses at inference (see resolve_offset_scale).
     offset_scale = model.det_head.offset_scale
 
-    logger.info("Loading data...")
-    train_dataset = VesselDataset(data_root, split="train", augment=True, max_det_targets=10)
+    logger.info(f"Task: {model.task} (masks on disk: {has_gt_masks}) | "
+                f"seg prior for det head: {model.use_seg_prior} "
+                f"(prior_channels={model.det_head.prior_channels})")
+    # Architecture knobs that change parameter SHAPES must be logged: without
+    # them the run cannot be reproduced from the log (and a checkpoint saved
+    # with a different value loads silently into a wrong architecture). Logged
+    # from the model, not the env: seg_prior/task in 'auto' mode depend on
+    # whether this run has masks, which the env alone does not say.
+    logger.info(f"Architecture: {resolve_arch_config(seg_prior=model.use_seg_prior, task=model.task, bank_deep_layers=getattr(model, 'bank_deep_layers', None), refiner=getattr(model, 'refiner_variant', None))}")
+    if not model.seg_enabled:
+        logger.info("Detection-only: seg/fg/router/consistency "
+                    "losses are skipped, only the det loss trains the shared "
+                    "features + adapters.")
+
     sampler = WeightedRandomSampler(sample_weights, num_samples=len(train_dataset),
                                     replacement=True)
     loader_kwargs = dict(
@@ -1038,15 +1078,28 @@ def train():
     best_det_ap50 = -1.0
     ap50_history = []
 
+    # early-stopping state + the per-val-point history that the ablation
+    # aggregation reads back from <OUT_PREFIX>_result.json
+    best_stop_metric = -1.0
+    best_epoch = 0
+    best_dice_per_class = None
+    best_ap50_med = None
+    no_improve = 0
+    epochs_run = 0
+    early_stopped = False
+    history = []
+
     for epoch in range(NUM_EPOCHS):
+        epochs_run = epoch + 1
         epoch_t0 = time.time()
         model.train()
         train_loss = 0
         train_fg_loss = 0
         train_consist_loss = 0
         train_router_loss = 0
+        train_router_bal_loss = 0
+        train_delta_l1_loss = 0
         train_det_loss = 0
-        train_cldice_loss = 0
 
         # Consistency weight decays linearly: the moving-target FG<->union
         # consistency loss destabilized late training (0.12 -> 0.50 over epochs
@@ -1063,44 +1116,49 @@ def train():
 
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
+            with torch.amp.autocast('cuda', dtype=AMP_DTYPE,
+                                    enabled=(device.type == 'cuda' and AMP_DTYPE is not None)):
                 output, _, _, det_outputs, consist_loss = model(images)
 
-                if isinstance(output, list):
-                    seg_loss = 0
-                    for iter_idx, seg_out in enumerate(output):
-                        if not torch.isfinite(seg_out).all():
-                            seg_out = torch.nan_to_num(seg_out, nan=0.0, posinf=1.0, neginf=-1.0)
-                        weight = 0.5 ** (len(output) - 1 - iter_idx)
-                        seg_loss = seg_loss + weight * criterion(seg_out, mask_full)
-                else:
-                    if not torch.isfinite(output).all():
-                        logger.warning("Non-finite output detected!")
-                        output = torch.nan_to_num(output, nan=0.0, posinf=1.0, neginf=-1.0)
-                    seg_loss = criterion(output, mask_full)
+                # Detection-only runs (no mask GT) leave every segmentation term
+                # at zero, so the loss expression below needs no branching and
+                # the model's zero consist_loss keeps the joint form valid.
+                seg_loss = torch.zeros((), device=device)
+                fg_loss = torch.zeros((), device=device)
+                router_loss = torch.zeros((), device=device)
+                router_bal_loss = torch.zeros((), device=device)
+                delta_l1_loss = torch.zeros((), device=device)
 
-                fg_out = model.fg_logits.squeeze(1)
-                fg_gt = (mask_full > 0).long().float()
-                num_fg = fg_gt.sum()
-                num_bg = fg_gt.numel() - num_fg
-                pos_weight = (num_bg / num_fg.clamp(min=1)).clamp(1.0, 50.0)
-                fg_loss = F.binary_cross_entropy_with_logits(fg_out, fg_gt, pos_weight=pos_weight)
+                if model.seg_enabled:
+                    if isinstance(output, list):
+                        seg_loss = 0
+                        # Historical geometric schedule: iteration i of T is
+                        # weighted 0.5**(T-1-i) -- for the shipped two-iteration
+                        # loop that is [0.5, 1.0]: the last refinement carries
+                        # the objective, the first pass is deep-supervised at
+                        # half weight so it stays a usable fallback.
+                        iter_w = [0.5 ** (len(output) - 1 - i) for i in range(len(output))]
+                        for iter_idx, seg_out in enumerate(output):
+                            if not torch.isfinite(seg_out).all():
+                                seg_out = torch.nan_to_num(seg_out, nan=0.0, posinf=1.0, neginf=-1.0)
+                            weight = iter_w[iter_idx]
+                            seg_loss = seg_loss + weight * criterion(seg_out, mask_full)
+                    else:
+                        if not torch.isfinite(output).all():
+                            logger.warning("Non-finite output detected!")
+                            output = torch.nan_to_num(output, nan=0.0, posinf=1.0, neginf=-1.0)
+                        seg_loss = criterion(output, mask_full)
 
-                router_loss = model.router_presence_loss(mask_full)
+                    fg_out = model.fg_logits.squeeze(1)
+                    fg_gt = (mask_full > 0).long().float()
+                    num_fg = fg_gt.sum()
+                    num_bg = fg_gt.numel() - num_fg
+                    pos_weight = (num_bg / num_fg.clamp(min=1)).clamp(1.0, 50.0)
+                    fg_loss = F.binary_cross_entropy_with_logits(fg_out, fg_gt, pos_weight=pos_weight)
 
-                # clDice on the per-structure probabilities of the LAST
-                # refinement iteration (deep-supervising every iteration would
-                # multiply an already large activation footprint).
-                cldice_loss = torch.tensor(0.0, device=device)
-                if CLDICE_WEIGHT > 0:
-                    last_out = output[-1] if isinstance(output, list) else output
-                    struct_prob = torch.softmax(last_out, dim=1)[:, 1:]
-                    gt_struct = F.one_hot(mask_full, NUM_CLASSES).permute(0, 3, 1, 2)[:, 1:]
-                    ch = CLDICE_CH
-                    cldice_loss = soft_cldice_loss(
-                        struct_prob[:, ch], gt_struct[:, ch].to(struct_prob.dtype),
-                        iters=CLDICE_ITER, smooth=CLDICE_SMOOTH)
-
+                    router_loss = model.router_presence_loss(mask_full)
+                    router_bal_loss = model.router_balance_loss(mask_full)
+                    delta_l1_loss = model.refiner_delta_penalty()
                 det_loss = compute_detection_loss(
                     det_outputs, det_boxes, det_labels, det_valid,
                     neg_topk=DET_NEG_K, neg_topk_weight=DET_NEG_WEIGHT,
@@ -1110,7 +1168,7 @@ def train():
                 loss = (seg_loss + FG_WEIGHT * fg_loss
                         + consist_weight * consist_loss
                         + ROUTER_WEIGHT * router_loss
-                        + CLDICE_WEIGHT * cldice_loss
+                        + ROUTER_BAL_WEIGHT * router_bal_loss
                         + DET_WEIGHT * det_loss)
 
             scaler.scale(loss).backward()
@@ -1125,8 +1183,9 @@ def train():
                 train_fg_loss += fg_loss.item()
                 train_consist_loss += consist_loss.item()
                 train_router_loss += router_loss.item()
+                train_router_bal_loss += router_bal_loss.item()
                 train_det_loss += det_loss.item()
-                train_cldice_loss += cldice_loss.item()
+                train_delta_l1_loss += delta_l1_loss.item()
             else:
                 logger.warning(f"NaN loss detected at epoch {epoch+1}, batch {i}")
             pbar.set_postfix({
@@ -1136,7 +1195,6 @@ def train():
                 "consist": f"{consist_loss.item():.4f}",
                 "router": f"{router_loss.item():.4f}",
                 "det": f"{det_loss.item():.4f}",
-                "cldice": f"{cldice_loss.item():.4f}"
             })
 
             del output, seg_loss, loss
@@ -1148,8 +1206,9 @@ def train():
         avg_fg_loss = train_fg_loss / len(train_loader)
         avg_consist_loss = train_consist_loss / len(train_loader)
         avg_router_loss = train_router_loss / len(train_loader)
+        avg_router_bal_loss = train_router_bal_loss / len(train_loader)
         avg_det_loss = train_det_loss / len(train_loader)
-        avg_cldice_loss = train_cldice_loss / len(train_loader)
+        avg_delta_l1_loss = train_delta_l1_loss / len(train_loader)
 
         if (epoch + 1) % VAL_EVERY == 0:
             logger.info(f"Epoch {epoch + 1}: Running unified validation (EMA weights)...")
@@ -1158,25 +1217,38 @@ def train():
                 model, data_root=data_root, split='val', output_base_dir='results',
                 save_viz=SAVE_VIZ)
 
-            if eval_results and det_results:
+            logger.info(f"Epoch {epoch + 1}: Train Loss: {avg_train_loss:.4f}, FG Loss: {avg_fg_loss:.4f}, Consist Loss: {avg_consist_loss:.4f}, Router Loss: {avg_router_loss:.4f}, RouterBal: {avg_router_bal_loss:.4f}, Det Loss: {avg_det_loss:.4f}, DeltaL1: {avg_delta_l1_loss:.4f} ({epoch_time:.0f}s)")
+
+            # eval_results is None when there is no segmentation to score (a
+            # detection-only run has no seg logits and/or no val masks); the two
+            # tasks are therefore logged and checkpointed independently instead
+            # of being gated on both being present.
+            if eval_results:
                 avg_class_dice = eval_results['dice_per_class']
                 current_mean_dice = np.mean(avg_class_dice)
                 mean_dice_fg = eval_results.get('mean_dice_fg', 0.0)
+
+                logger.info(f"Validation Results - Mean Dice (All): {current_mean_dice:.4f}, Mean Dice (FG): {mean_dice_fg:.4f}")
+                dice_per_class_str = ", ".join([f"{d:.4f}" for d in avg_class_dice])
+                logger.info(f"Dice per class: [{dice_per_class_str}]")
+
+                # EMA weights are already applied -> saved checkpoints are EMA snapshots.
+                if mean_dice_fg > best_mean_dice_fg:
+                    best_mean_dice_fg = mean_dice_fg
+                    save_checkpoint(model, f"{OUT_PREFIX}_seg.pth")
+                    logger.info(f"Saved best segmentation model with Mean Dice (FG): {best_mean_dice_fg:.4f}")
+
+            if det_results:
                 det_ap50 = det_results['ap50']
                 det_mean_matched_iou = det_results['mean_matched_iou']
                 det_mean_best_iou = det_results['mean_best_iou']
                 det_precision = det_results['precision']
                 det_recall = det_results['recall']
-                joint_score = 0.5 * mean_dice_fg + 0.5 * det_ap50
 
                 ap50_history.append(det_ap50)
                 ap50_history = ap50_history[-3:]
                 det_ap50_med = float(np.median(ap50_history)) if len(ap50_history) == 3 else det_ap50
 
-                logger.info(f"Epoch {epoch + 1}: Train Loss: {avg_train_loss:.4f}, FG Loss: {avg_fg_loss:.4f}, Consist Loss: {avg_consist_loss:.4f}, Router Loss: {avg_router_loss:.4f}, Det Loss: {avg_det_loss:.4f}, clDice: {avg_cldice_loss:.4f} ({epoch_time:.0f}s)")
-                logger.info(f"Validation Results - Mean Dice (All): {current_mean_dice:.4f}, Mean Dice (FG): {mean_dice_fg:.4f}")
-                dice_per_class_str = ", ".join([f"{d:.4f}" for d in avg_class_dice])
-                logger.info(f"Dice per class: [{dice_per_class_str}]")
                 logger.info("=" * 80)
                 logger.info(f"{'Detection Metric':<40} {'Value':<15}")
                 logger.info("-" * 80)
@@ -1191,13 +1263,10 @@ def train():
                 logger.info(f"{'Total Ground Truth':<40} {det_results['num_gt']}")
                 logger.info(f"{'Total Predictions':<40} {det_results['num_predictions']}")
                 logger.info("=" * 80)
-                logger.info(f"Joint Validation Score (diagnostic only, not checkpointed): {joint_score:.4f}")
-
-                # EMA weights are already applied -> saved checkpoints are EMA snapshots.
-                if mean_dice_fg > best_mean_dice_fg:
-                    best_mean_dice_fg = mean_dice_fg
-                    save_checkpoint(model, f"{OUT_PREFIX}_seg.pth")
-                    logger.info(f"Saved best segmentation model with Mean Dice (FG): {best_mean_dice_fg:.4f}")
+                if eval_results:
+                    joint_score = (0.5 * eval_results.get('mean_dice_fg', 0.0)
+                                   + 0.5 * det_ap50)
+                    logger.info(f"Joint Validation Score (diagnostic only, not checkpointed): {joint_score:.4f}")
 
                 if det_ap50_med > best_det_ap50:
                     best_det_ap50 = det_ap50_med
@@ -1208,19 +1277,74 @@ def train():
             # snapshots are the EMA weights that were actually validated.
             # (Previously restore ran before save, so checkpoints held raw
             # training weights instead of EMA weights.)
+            # ---- monitored metric, history, early stopping ----
+            dice_fg = float(eval_results.get('mean_dice_fg', 0.0)) if eval_results else None
+            dice_all = float(np.mean(eval_results['dice_per_class'])) if eval_results else None
+            per_class = [float(d) for d in eval_results['dice_per_class']] if eval_results else None
+            ap50_raw = float(det_ap50) if det_results else None
+            ap50_med = float(det_ap50_med) if det_results else None
+            if STOP_METRIC == 'ap50':
+                cur = ap50_med if ap50_med is not None else (dice_fg or 0.0)
+            elif STOP_METRIC == 'joint':
+                cur = 0.5 * (dice_fg or 0.0) + 0.5 * (ap50_med or 0.0)
+            else:                                   # 'dice' (default)
+                cur = dice_fg if dice_fg is not None else (ap50_med or 0.0)
+            history.append({'epoch': epoch + 1, 'dice_fg': dice_fg, 'dice_all': dice_all,
+                            'dice_per_class': per_class, 'ap50': ap50_raw,
+                            'ap50_median': ap50_med, 'stop_metric': cur})
+            if cur > best_stop_metric:
+                best_stop_metric = cur
+                best_epoch = epoch + 1
+                best_dice_per_class = per_class
+                best_ap50_med = ap50_med
+                no_improve = 0
+            else:
+                no_improve += VAL_EVERY
+                logger.info(f"  no improvement on '{STOP_METRIC}' for {no_improve} epochs "
+                            f"(best {best_stop_metric:.4f} @ epoch {best_epoch})")
+
+            # Restore training weights AFTER checkpoint saving so the saved
+            # snapshots are the EMA weights that were actually validated.
+            # (Previously restore ran before save, so checkpoints held raw
+            # training weights instead of EMA weights.)
             ema.restore_from(model, ema_backup)
             if device.type == 'cuda':
                 torch.cuda.empty_cache()
+
+            if EARLY_STOP and no_improve >= EARLY_STOP:
+                logger.info(f"EARLY STOP at epoch {epoch + 1}: '{STOP_METRIC}' has not improved for "
+                            f"{no_improve} epochs (patience {EARLY_STOP}); best {best_stop_metric:.4f} "
+                            f"@ epoch {best_epoch}")
+                early_stopped = True
+                break
         else:
-            logger.info(f"Epoch {epoch + 1}: Train Loss: {avg_train_loss:.4f}, FG Loss: {avg_fg_loss:.4f}, Consist Loss: {avg_consist_loss:.4f}, Router Loss: {avg_router_loss:.4f}, Det Loss: {avg_det_loss:.4f}, clDice: {avg_cldice_loss:.4f} ({epoch_time:.0f}s)")
+            logger.info(f"Epoch {epoch + 1}: Train Loss: {avg_train_loss:.4f}, FG Loss: {avg_fg_loss:.4f}, Consist Loss: {avg_consist_loss:.4f}, Router Loss: {avg_router_loss:.4f}, RouterBal: {avg_router_bal_loss:.4f}, Det Loss: {avg_det_loss:.4f}, DeltaL1: {avg_delta_l1_loss:.4f} ({epoch_time:.0f}s)")
 
         for handler in logger.handlers:
             handler.flush()
 
-        if STOP_EPOCH and (epoch + 1) >= STOP_EPOCH:
-            logger.info(f"Stopping after epoch {epoch + 1} (SD2_STOP_EPOCH={STOP_EPOCH}); "
-                        f"LR and consistency schedules were kept at the {NUM_EPOCHS}-epoch config.")
-            break
+    # ---- machine-readable summary for the ablation aggregation ----
+    result = {
+        'tag': RUN_TAG, 'fg_weight': FG_WEIGHT, 'router_weight': ROUTER_WEIGHT,
+        'router_bal_weight': ROUTER_BAL_WEIGHT, 'det_weight': DET_WEIGHT,
+        'consist_w0': CONSIST_W0, 'consist_w1': CONSIST_W1, 'lr': LR,
+        'epochs': NUM_EPOCHS, 'epochs_run': epochs_run, 'val_every': VAL_EVERY,
+        'early_stop': EARLY_STOP, 'stop_metric': STOP_METRIC,
+        'early_stopped': early_stopped, 'num_iterations': NUM_ITERATIONS,
+        'bank_layers': os.environ.get('SD2_BANK_LAYERS', 'all'),
+        'task': os.environ.get('SD2_TASK', 'auto'), 'data_root': data_root, 'seed': int(seed),
+        'best_stop_metric': best_stop_metric, 'best_epoch': best_epoch,
+        'best_mean_dice_fg': best_mean_dice_fg, 'best_dice_all': (float(np.mean(best_dice_per_class)) if best_dice_per_class else None),
+        'best_dice_per_class': best_dice_per_class, 'best_ap50_median': best_ap50_med,
+        'history': history,
+    }
+    res_path = f"{OUT_PREFIX}_result.json"
+    try:
+        with open(res_path, 'w') as fh:
+            json.dump(result, fh, indent=1)
+        logger.info(f"Result summary written to {res_path}")
+    except Exception as exc:                        # never fail a finished run on this
+        logger.warning(f"Could not write {res_path}: {exc}")
 
 
 if __name__ == "__main__":

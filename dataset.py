@@ -21,12 +21,29 @@ COLOR_TO_ID = {
 }
 
 
+def has_masks(root_dir, split):
+    """True when {root_dir}/{split}/masks exists and holds at least one image.
+
+    Detection-only datasets ship no masks directory; callers use this to decide
+    whether segmentation supervision exists at all.
+    """
+    d = os.path.join(root_dir, split, 'masks')
+    if not os.path.isdir(d):
+        return False
+    return any(f.lower().endswith(('.png', '.jpg', '.jpeg')) for f in os.listdir(d))
+
+
 class VesselDataset(Dataset):
     """Dataset for vessel segmentation + detection.
 
     Detection uses ONLY the official COCO-style annotations under
     {split}_detect/annotations: plain images + bounding-box GT (normalized
     cxcywh). No mask-derived synthetic boxes, no weak labels.
+
+    Masks are optional. A detection-only dataset has no {split}/masks directory
+    at all; a missing mask file then yields an all-background mask so the batch
+    shapes stay unchanged, while `has_masks` is False so callers skip every
+    segmentation loss. Box GT is unaffected either way.
     """
 
     def __init__(self, root_dir, split='train', img_size=1024, augment=False, max_det_targets=10):
@@ -38,6 +55,7 @@ class VesselDataset(Dataset):
 
         self.images_dir = os.path.join(root_dir, split, 'images')
         self.masks_dir = os.path.join(root_dir, split, 'masks')
+        self.has_masks = has_masks(root_dir, split)
         self.detect_ann_dir = os.path.join(root_dir, f'{split}_detect', 'annotations')
 
         self.image_files = sorted(
@@ -161,24 +179,33 @@ class VesselDataset(Dataset):
             mask_out[match] = idx
         return torch.from_numpy(mask_out).long()
 
+    def _find_mask_path(self, img_name):
+        """Resolve the mask file for an image, or None when the dataset has none.
+
+        Detection-only datasets have no masks directory; an individual missing
+        file is treated the same way (all-background mask) rather than raising,
+        so a partially masked dataset still loads.
+        """
+        base, ext = os.path.splitext(img_name)
+        for candidate in [ext, '.png', '.jpg', '.jpeg']:
+            if not candidate:
+                continue
+            path = os.path.join(self.masks_dir, base + candidate)
+            if os.path.exists(path):
+                return path
+        return None
+
     def __len__(self):
         return len(self.image_files)
 
     def __getitem__(self, idx):
         img_name = self.image_files[idx]
         img_path = os.path.join(self.images_dir, img_name)
-        mask_path = os.path.join(self.masks_dir, img_name)
-
-        if not os.path.exists(mask_path):
-            base, _ = os.path.splitext(img_name)
-            for ext in ['.png', '.jpg', '.jpeg']:
-                temp_path = os.path.join(self.masks_dir, base + ext)
-                if os.path.exists(temp_path):
-                    mask_path = temp_path
-                    break
+        mask_path = self._find_mask_path(img_name)
 
         image = Image.open(img_path).convert('RGB')
-        mask = Image.open(mask_path).convert('RGB')
+        # No mask -> the padded canvas below stays all background (class 0).
+        mask_src = Image.open(mask_path).convert('RGB') if mask_path else None
         orig_w, orig_h = image.size
 
         # --- Aspect-preserving random multi-scale (train) ---
@@ -193,13 +220,13 @@ class VesselDataset(Dataset):
         new_w = max(1, round(orig_w * scale))
         new_h = max(1, round(orig_h * scale))
         image = image.resize((new_w, new_h), Image.BILINEAR)
-        mask = mask.resize((new_w, new_h), Image.NEAREST)
         pad_l = (self.img_size - new_w) // 2
         pad_t = (self.img_size - new_h) // 2
         padded_image = Image.new('RGB', (self.img_size, self.img_size), self._mean_pixel)
         padded_image.paste(image, (pad_l, pad_t))
         padded_mask = Image.new('RGB', (self.img_size, self.img_size), (0, 0, 0))
-        padded_mask.paste(mask, (pad_l, pad_t))
+        if mask_src is not None:
+            padded_mask.paste(mask_src.resize((new_w, new_h), Image.NEAREST), (pad_l, pad_t))
         image, mask = padded_image, padded_mask
 
         det_boxes, det_labels, det_valid = self.load_detection(img_name)

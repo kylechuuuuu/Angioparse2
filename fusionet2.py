@@ -1,10 +1,12 @@
 import math
 import os
+import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import Sam3VideoConfig
 from transformers.models.sam3.modeling_sam3 import Sam3VisionModel
+from torch.utils.checkpoint import checkpoint
 
 
 def resolve_offset_scale():
@@ -58,29 +60,163 @@ def resolve_extra_upsample():
     return int(os.environ.get('SD2_EXTRA_UP', '1'))
 
 
-def resolve_bank_layers():
-    """Number of deepest backbone layers that use the structure-aware AdapterBank.
+def resolve_seg_prior(has_masks=None):
+    """Whether the detection head consumes the class-1 segmentation prior.
 
-    Shallower layers always use the shared MLPAdapter. SD2_BANK_LAYERS=0 drops
-    the bank entirely (a single shared adapter everywhere), which is the AB-off
-    arm of the component-wise ablation.
+    'auto' (default) ties the prior to whether this run actually has
+    segmentation supervision: with masks the class-1 head is trained and its
+    probability is a real spatial prior on the lesion, so it is fed to the det
+    stem. Without masks that head never receives a gradient, and feeding an
+    untrained sigmoid would inject noise into the stem instead of suppressing
+    false positives -- so the prior is dropped.
+
+    SD2_SEG_PRIOR=1/0 forces the choice (e.g. to measure what the prior is
+    worth on a joint run). has_masks=None means the caller does not know; auto
+    then keeps the historical behaviour (prior on).
     """
-    return int(os.environ.get('SD2_BANK_LAYERS', '8'))
+    raw = os.environ.get('SD2_SEG_PRIOR', 'auto').strip().lower()
+    if raw in ('0', 'false', 'no', 'off'):
+        return False
+    if raw in ('1', 'true', 'yes', 'on'):
+        return True
+    if has_masks is None:
+        return True
+    return bool(has_masks)
 
 
-def resolve_arch_config():
+def resolve_task(has_masks=None):
+    """Which branches the model runs: 'joint' (seg + det) or 'det'.
+
+    'auto' (default) picks 'joint' when segmentation GT is available and 'det'
+    otherwise. With no masks the seg losses have no target, so running the seg
+    heads, the fg head and the iterative refiner would burn the majority of the
+    forward/backward cost to produce untrained logits. Both branches are still
+    CONSTRUCTED in either mode (so the two checkpoints stay key-compatible and
+    a det-only run can be resumed into a joint one); 'det' only skips them in
+    forward().
+
+    SD2_TASK=det/joint forces the choice.
+    """
+    raw = os.environ.get('SD2_TASK', 'auto').strip().lower()
+    if raw in ('det', 'detect', 'detection', 'det_only', 'detonly'):
+        return 'det'
+    if raw in ('joint', 'seg', 'both'):
+        return 'joint'
+    if has_masks is None:
+        return 'joint'
+    return 'joint' if has_masks else 'det'
+
+
+def resolve_bank_deep_layers():
+    """How many of the DEEPEST encoder layers get a full AdapterBank.
+
+    DEFAULT = all 32 layers (SD2_BANK_LAYERS=all / -1): every encoder layer gets
+    an AdapterBank so the structure-conditioned routing acts over the whole
+    encoder. An integer N builds a bank on the N deepest layers only (the
+    historical 8 was measured to be behind, and its routers saturate in 7/8
+    layers); 0 keeps a shared MLPAdapter on every layer (no bank at all).
+
+    This changes adapter PARAMETER SHAPES, so it is part of the arch sidecar: a
+    checkpoint trained with N banks does not load into a model built with
+    M != N under strict=False -- the extra adapter/router keys keep their
+    random init and the run silently degrades instead of erroring.
+    """
+    raw = os.environ.get('SD2_BANK_LAYERS', 'all').strip().lower()
+    if raw in ('all', 'full', '-1'):
+        return -1          # -1 = every layer
+    return int(raw)
+
+
+def resolve_router_target():
+    """'legacy' (default) keeps the raw binary presence target; 'norm' normalises it
+    over the classes present in that image (opt-in -- see the ratchet below).
+
+    The raw target is a one-way ratchet: a class present in every training image
+    (here class 1, the ICA bulb) has target 1 in 100% of steps, so its logit
+    climbs with no counter-force and the softmax saturates onto it -- measured on
+    the previous all-bank run: 15/32 layers with max w = 1.000, entropy 0, the
+    other five adapters at w ~ 1e-5. Normalising makes the per-image target sum
+    to 1, so no class can own it alone.
+
+    'none' drops the presence supervision altogether: the K adapters become K
+    generic experts selected by the image, and only the load-balance term acts on
+    the router (self-balancing: demand := supply, so the term is K*sum(supply^2)-1
+    and 0 at a uniform utilisation). Use it when the per-class binding is not
+    claimed -- measured, the binding never materialised in either supervised mode
+    (adapter self-match 31/192 for 'legacy', 13/192 for 'norm', chance 32/192).
+    """
+    return os.environ.get('SD2_ROUTER_TARGET', 'legacy').strip().lower()
+
+
+def resolve_router_drop_always():
+    """Presence rate at/above which a class is dropped from the routing target.
+
+    0 (default) keeps every class. train.py measures the per-class presence rate
+    on the train split and hands it to the model (model.class_presence): a class
+    present in >= this fraction of images carries no routing information, so its
+    BCE term is masked out instead of being satisfied by a saturated logit.
+    """
+    return float(os.environ.get('SD2_ROUTER_DROP_ALWAYS', '0.0'))
+
+
+def resolve_router_balance_weight():
+    """Weight of the Switch-style load-balance term on the router weights."""
+    return float(os.environ.get('SD2_ROUTER_BAL_W', '0.01'))
+
+
+def resolve_refiner():
+    """Which residual refiner the iterative loop applies (SD2_REFINER).
+
+    Only 'legacy' ships: two 3x3 convs at hidden 32 on the FULL-resolution stack
+    -- receptive field ~5 px, i.e. local speckle removal. The iterative loop
+    (SD2_ITERATIONS) is the refinement mechanism; this module is the step.
+
+    Measured variants that were removed after the 2026-09 measurements:
+      'deep' / 'ms' (dilated / multi-scale, RF 31-120 px) never beat running no
+        refiner at all (220-image A/B: control 0.7975 vs deep 0.7946 / ms 0.7941),
+        so width of receptive field is not the bottleneck.
+      'p1' (raw high-frequency detail channels as extra evidence) fixed the
+        mechanism (its correction landed 7.1x more on iter0's errors) but bought
+        only ~+0.003 arm-level Dice for ~10% more epoch time, and lost to the
+        legacy refiner on the same 60-image protocol.
+    See README_allbank.md for the full set of numbers.
+    """
+    raw = (os.environ.get('SD2_REFINER') or 'legacy').strip().lower()
+    if raw not in ('legacy', '', 'off', 'none'):
+        warnings.warn(f"SD2_REFINER={raw!r} was removed from this tree; "
+                      f"using 'legacy'. Set SD2_ITERATIONS=1 for no refinement.")
+    return 'legacy'
+
+
+def resolve_arch_config(seg_prior=None, task=None, bank_deep_layers=None,
+                        refiner=None):
     """Every env knob that changes the parameter SHAPE or the box decoding.
 
     Written next to each checkpoint so a saved model is self-describing: if any
     of these differ at load time the weights cannot be interpreted correctly.
+
+    seg_prior/task are passed through from the model instance by save_checkpoint
+    rather than re-resolved from the env: they are what the saved weights were
+    actually built and trained with, which is what a loader needs to reproduce.
     """
     return {
         'extra_upsample': resolve_extra_upsample(),
-        'bank_layers': resolve_bank_layers(),
         'dilations': list(resolve_dilations()),
         'offset_scale': resolve_offset_scale(),
         'size_prior': resolve_size_prior(),
         'num_classes': 7,
+        # Consuming the prior adds one input channel to the det stem, so this
+        # changes a parameter shape and must round-trip through the sidecar.
+        'seg_prior': resolve_seg_prior() if seg_prior is None else bool(seg_prior),
+        'task': resolve_task() if task is None else task,
+        # Every banked layer swaps its MLPAdapter for an AdapterBank, so the
+        # adapter/router key set -- and therefore what the weights mean --
+        # depends on this count.
+        'bank_deep_layers': (resolve_bank_deep_layers() if bank_deep_layers is None
+                             else int(bank_deep_layers)),
+        # Recorded so a loader rebuilds the same refiner keys. Only 'legacy'
+        # exists in this tree.
+        'refiner': (resolve_refiner() if refiner is None else refiner),
     }
 
 
@@ -166,13 +302,18 @@ class IterativeResidualRefiner(nn.Module):
         entropy = -torch.sum(probs * torch.log(probs + 1e-6), dim=1, keepdim=True)
         return entropy, probs
 
-    def forward_step(self, feat, cur_seg_out, cur_fg_logits):
+    def forward_step(self, feat, cur_seg_out, cur_fg_logits, raw=None):
         """Perform one step of residual refinement.
 
         Args:
             feat: [B, feat_dim, H, W] shared fusion features
             cur_seg_out: [B, num_classes, H, W] current full logits
             cur_fg_logits: [B, 1, H, W] current binary foreground logits
+            raw: [B, 3, H, W] model input. Unused by this refiner: the input
+                 stack is closed (every channel is a function of `feat` and the
+                 current prediction), which is exactly why a closed refiner can
+                 only re-sharpen what iter0 already said. Kept in the API for
+                 variants that read the untouched pixels.
 
         Returns:
             updated_seg_out: [B, num_classes, H, W]
@@ -182,6 +323,7 @@ class IterativeResidualRefiner(nn.Module):
         entropy, probs = self._compute_entropy(cur_seg_out)
         refine_in = torch.cat([feat, cur_seg_out, entropy, probs], dim=1)
         delta = self.refine_net(refine_in)
+        self.last_delta_l1 = delta.abs().mean()
 
         delta_seg = delta[:, :self.num_classes]
         delta_fg = delta[:, self.num_classes:self.num_classes + 1]
@@ -451,6 +593,10 @@ class UNetBranch(nn.Module):
         return self.out_conv(x)
 
 
+SAM3_INPUT = 1008   # SAM3 vision input side length (see SAM3VisionEncoder.forward)
+SAM3_PATCH = 14     # ViT patch size -> why the adapter bank sees a 72x72 token grid
+
+
 class AdapterBank(nn.Module):
     """Structure-specific adapter bank with input-conditioned routing.
 
@@ -469,7 +615,8 @@ class AdapterBank(nn.Module):
     Zero-init on all adapter output projections → gradual specialization
     without disrupting pre-trained features at the start of training.
     """
-    def __init__(self, original_mlp, dim, adapter_dim=64, num_structures=6, temperature=1.0):
+    def __init__(self, original_mlp, dim, adapter_dim=64, num_structures=6, temperature=1.0,
+                 use_checkpoint=None):
         super().__init__()
         self.num_structures = num_structures
         # Router outputs of the most recent forward pass, exposed for the
@@ -507,6 +654,17 @@ class AdapterBank(nn.Module):
             nn.Linear(dim // 4, num_structures),
         )
 
+        # Gradient checkpointing over the adapter aggregation. A bank keeps
+        # num_structures+1 adapter outputs of shape [B, N, dim] alive for the
+        # backward pass; with a bank on all 32 ViT layers that is ~3.5 GiB on top
+        # of an already ~19 GiB activation footprint, i.e. OOM on a 24 GB card.
+        # Recomputing instead of storing costs ~10% epoch time and is
+        # mathematically identical, so it is on by default when a bank is used
+        # (SD2_ADAPTER_CKPT=0 disables it, e.g. on a bigger GPU).
+        if use_checkpoint is None:
+            use_checkpoint = os.environ.get('SD2_ADAPTER_CKPT', '1') == '1'
+        self.use_checkpoint = use_checkpoint
+
     def forward(self, x):
         with torch.no_grad():
             orig_out = self.original_mlp(x)
@@ -517,14 +675,26 @@ class AdapterBank(nn.Module):
         self.last_router_w = router_w
         self.last_router_logits = router_logits
 
+        # The router weight is passed as a checkpoint *input*, so the router
+        # keeps its own (tiny) graph outside the checkpointed region and still
+        # receives gradients.
+        use_ckpt = (self.use_checkpoint and torch.is_grad_enabled()
+                    and x.requires_grad)
+        if use_ckpt:
+            out = checkpoint(self._bank_forward, x, router_w, use_reentrant=False)
+        else:
+            out = self._bank_forward(x, router_w)
+
+        return orig_out + out
+
+    def _bank_forward(self, x, router_w):
         out = self.global_adapter(x)
         for i, adapter in enumerate(self.struct_adapters):
-            w = router_w[:, i:i+1]
+            w = router_w[:, i:i + 1]
             for _ in range(x.dim() - 2):
                 w = w.unsqueeze(-1)
             out = out + w * adapter(x)
-
-        return orig_out + out
+        return out
 
 
 class MLPAdapter(nn.Module):
@@ -551,7 +721,7 @@ class MLPAdapter(nn.Module):
         return orig_out + self.adapter(x)
 
 
-def apply_adapter_to_sam3(encoder, adapter_dim=64, bank_deep_layers=8, num_structures=6):
+def apply_adapter_to_sam3(encoder, adapter_dim=64, bank_deep_layers=-1, num_structures=6):
     """Apply adapter-based fine-tuning to SAM3 encoder.
 
     Shallow layers use shared MLPAdapter (lightweight, general features).
@@ -561,21 +731,31 @@ def apply_adapter_to_sam3(encoder, adapter_dim=64, bank_deep_layers=8, num_struc
         encoder: SAM3VisionEncoder instance
         adapter_dim: bottleneck dimension for adapters
         bank_deep_layers: number of deepest layers to apply AdapterBank.
-                          Set to 0 to use MLPAdapter everywhere.
+                          -1 (or any negative) = EVERY layer gets an AdapterBank
+                             (SD2_BANK_LAYERS=all)
+                           0 = no bank, MLPAdapter everywhere
         num_structures: number of structure adapters per AdapterBank (one per
                         vessel class, excluding background).
     """
     backbone = encoder.backbone
     num_layers = len(backbone.layers)
 
+    bank_all = bank_deep_layers < 0 or bank_deep_layers >= num_layers
+    first_bank = 0 if bank_all else num_layers - bank_deep_layers
+
     for i, layer in enumerate(backbone.layers):
         orig_mlp = layer.mlp
         dim = orig_mlp.fc2.out_features
 
-        if bank_deep_layers > 0 and i >= num_layers - bank_deep_layers:
-            layer.mlp = AdapterBank(orig_mlp, dim, adapter_dim, num_structures=num_structures)
+        if bank_deep_layers != 0 and (bank_all or i >= first_bank):
+            layer.mlp = AdapterBank(orig_mlp, dim, adapter_dim,
+                                    num_structures=num_structures)
         else:
             layer.mlp = MLPAdapter(orig_mlp, dim, adapter_dim)
+
+    n_banks = sum(isinstance(l.mlp, AdapterBank) for l in backbone.layers)
+    print(f"[apply_adapter_to_sam3] AdapterBank on {n_banks}/{num_layers} layers "
+          f"(dim={dim}, adapter_dim={adapter_dim}, num_structures={num_structures})")
 
 
 class PixelShuffleUpsample(nn.Module):
@@ -644,9 +824,10 @@ class DilatedResBlock(nn.Module):
     """Residual block with a dilated 3x3 conv: enlarges the receptive field at
     constant resolution (no stride, no parameter blow-up).
 
-    The 1x1 output conv is zero-initialized so every block starts as identity
-    and only contributes once the detection losses demand it — keeps the
-    focal-loss dynamics of the shallow head intact early in training.
+    Used by the detection head trunk. The 1x1 output conv is zero-initialized so
+    every block starts as identity and only contributes once the detection
+    losses demand it -- keeps the focal-loss dynamics of the shallow head intact
+    early in training.
     """
     def __init__(self, channels, dilation=1):
         super().__init__()
@@ -662,6 +843,14 @@ class DilatedResBlock(nn.Module):
         out = F.gelu(self.norm1(self.conv1(x)))
         out = self.norm2(self.conv2(out))
         return x + out
+
+
+def build_refiner(variant, feat_dim=64, num_classes=7):
+    """Instantiate the residual refiner step (only 'legacy' ships -- see
+    resolve_refiner for why the deeper variants were removed)."""
+    if variant not in ('legacy', '', 'off', 'none'):
+        warnings.warn(f"refiner variant {variant!r} was removed; building 'legacy'.")
+    return IterativeResidualRefiner(feat_dim=feat_dim, num_classes=num_classes)
 
 
 class DetectionHead(nn.Module):
@@ -686,6 +875,10 @@ class DetectionHead(nn.Module):
     detached by the caller) that is concatenated to the features. This focuses
     the heatmap on candidate lesion regions and suppresses spurious peaks on
     other vessels / background.
+
+    prior_channels=0 builds the stem without that input (detection-only runs,
+    where no trained class-1 head exists); the head then sees the fusion
+    features alone and a prior must not be passed to forward().
 
     forward() also decodes the top-k heatmap peaks into normalized cxcywh
     boxes, consumed directly by evaluation / visualization.
@@ -738,6 +931,12 @@ class DetectionHead(nn.Module):
 
     def forward(self, fused_features, prior=None):
         B = fused_features.shape[0]
+        if prior is not None and self.prior_channels == 0:
+            # Built without a prior channel: silently ignoring the tensor would
+            # make a caller believe the prior is contributing when it is not.
+            raise ValueError(
+                "DetectionHead was built with prior_channels=0 (seg prior "
+                "disabled) but a prior was passed in")
         if prior is not None:
             if prior.shape[2:] != fused_features.shape[2:]:
                 prior = F.interpolate(prior, size=fused_features.shape[2:],
@@ -774,20 +973,44 @@ class DetectionHead(nn.Module):
 
 
 class FusionModel(nn.Module):
-    def __init__(self, num_classes=7, num_det_queries=50, num_iterations=2):
+    def __init__(self, num_classes=7, num_det_queries=50, num_iterations=2,
+                 use_seg_prior=None, task=None):
         super().__init__()
+        # task='det' skips the whole segmentation branch in forward(); it is
+        # resolved from the presence of mask GT unless forced (see resolve_task).
+        # Both branches are built either way so the two modes keep identical
+        # parameter names and can load each other's checkpoints.
+        self.task = resolve_task() if task is None else task
+        self.seg_enabled = (self.task == 'joint')
+        # Whether the det head consumes the class-1 seg prior. Off without
+        # segmentation supervision: an untrained class-1 head would only add
+        # noise to the det stem (see resolve_seg_prior).
+        self.use_seg_prior = (resolve_seg_prior() if use_seg_prior is None
+                              else bool(use_seg_prior))
+
         self.branch1 = UNetBranch(3, out_feat=32)
 
         self.encoder_tuned = SAM3VisionEncoder()
         for param in self.encoder_tuned.parameters():
             param.requires_grad = False
+        # SD2_BANK_LAYERS: how many (or all) encoder layers carry an
+        # AdapterBank. Resolved once here and kept on the instance so the arch
+        # sidecar records what these weights were actually built with.
+        self.bank_deep_layers = resolve_bank_deep_layers()
+        # Loss-side configuration: where the adapter class supervision reads
+        # from, how the router presence target is built, and which classes carry
+        # no routing information. class_presence is filled in by train.py from
+        # the train split (None = no class is dropped).
+        self.router_target = resolve_router_target()
+        self.router_drop_always = resolve_router_drop_always()
+        self.class_presence = None
         apply_adapter_to_sam3(self.encoder_tuned, adapter_dim=64,
-                              bank_deep_layers=resolve_bank_layers(),
-                              num_structures=num_classes - 1)
+                              num_structures=num_classes - 1,
+                              bank_deep_layers=self.bank_deep_layers)
         for name, param in self.encoder_tuned.named_parameters():
             if 'adapter' in name or 'router' in name:
                 param.requires_grad = True
-        # Collect AdapterBanks (deep layers) for the router-presence aux loss.
+        # Collect AdapterBanks for the router-presence aux loss.
         self.adapter_banks = [
             layer.mlp for layer in self.encoder_tuned.backbone.layers
             if isinstance(layer.mlp, AdapterBank)
@@ -817,15 +1040,18 @@ class FusionModel(nn.Module):
         self.fg_logits = None
         self.consistency_criterion = StructureConsistencyLoss(alpha_consist=0.5)
 
-        # Uncertainty-guided iterative residual refiner (low memory footprint)
-        self.refiner = IterativeResidualRefiner(
-            feat_dim=64, num_classes=num_classes, hidden_dim=32
-        )
+        # Uncertainty-guided iterative residual refiner (legacy step).
+        # stack ('legacy' = the 2-conv full-res module the iteration ablation was
+        # run with; see resolve_refiner for the measured numbers).
+        self.refiner_variant = resolve_refiner()
+        self.refiner = build_refiner(self.refiner_variant, feat_dim=64,
+                                     num_classes=num_classes)
 
         # Detection: simple single-class anchor-free head on the shared features.
         self.det_head = DetectionHead(
             in_channels=64,
             num_queries=num_det_queries,
+            prior_channels=1 if self.use_seg_prior else 0,
         )
         self.det_grad_scale = resolve_det_grad_scale()
 
@@ -854,12 +1080,15 @@ class FusionModel(nn.Module):
 
         return seg_out, fg_logits, struct_logits
 
-    def _iterative_forward(self, combined, num_iterations):
+    def _iterative_forward(self, combined, num_iterations, raw=None):
         """Iterative residual refinement: computes prediction entropy and applies Δlogits.
 
         Args:
             combined: [B, 64, H, W] fusion feature map
             num_iterations: number of refinement iterations (e.g. 2 or 3)
+            raw: [B, 3, H, W] model input. Kept in the refiner API for variants
+                that want the untouched pixels; the shipped legacy refiner only
+                reads `combined` + the current prediction, so this is unused.
 
         Returns:
             all_seg:       list of seg_out per iteration.
@@ -868,17 +1097,32 @@ class FusionModel(nn.Module):
             combined:      features passed to detection head.
         """
         all_seg = []
+        self._delta_l1 = []
         seg_out, fg_logits, struct_logits = self._seg_forward(combined)
         all_seg.append(seg_out)
 
         for _ in range(num_iterations - 1):
             seg_out, fg_logits, struct_logits = self.refiner.forward_step(
-                combined, seg_out, fg_logits
+                combined, seg_out, fg_logits, raw=raw
             )
             all_seg.append(seg_out)
+            pen = getattr(self.refiner, 'last_delta_l1', None)
+            if pen is not None:
+                self._delta_l1.append(pen)
 
         self.fg_logits = fg_logits
         return all_seg, fg_logits, struct_logits, combined
+
+    def refiner_delta_penalty(self):
+        """Mean |delta| the refiner emitted in the last iterative forward.
+
+        Telemetry only: train.py logs it as DeltaL1 (how far the refiner moves
+        the logits per step). 0.0 when no refinement ran.
+        """
+        pens = getattr(self, '_delta_l1', None)
+        if not pens:
+            return torch.zeros(())
+        return torch.stack(list(pens)).mean()
 
     def _det_forward(self, refined, struct_logits=None):
         """Detection head conditioned on the class-1 (noise / ICA-bulb) seg.
@@ -889,13 +1133,17 @@ class FusionModel(nn.Module):
         strong spatial prior: the heatmap is focused on candidate lesion regions
         and spurious detections on other vessels / background are suppressed.
 
+        The prior is only consumed when this run has segmentation supervision
+        (self.use_seg_prior): in a detection-only run struct_logits is either
+        absent or untrained, and the head's stem has no prior channel to fill.
+
         The class-1 prior is always detached. The shared fusion features get
         their det gradient scaled by self.det_grad_scale (0 = hard detach,
         1 = full coupling; see resolve_det_grad_scale for the measured
         trade-off between detection AP and thin-vessel Dice).
         """
         prior = None
-        if struct_logits is not None:
+        if self.use_seg_prior and struct_logits is not None:
             prior = torch.sigmoid(struct_logits[:, 0:1]).detach()  # [B, 1, H, W]
         if self.det_grad_scale >= 1.0:
             det_input = refined
@@ -912,9 +1160,10 @@ class FusionModel(nn.Module):
         pred_boxes, pred_logits, det_outputs = self._det_forward(combined, struct_logits)
         return seg_out, pred_boxes, pred_logits, det_outputs, consist_loss
 
-    def _task_forward_iterative(self, combined, num_iterations):
+    def _task_forward_iterative(self, combined, num_iterations, raw=None):
         """Iterative forward with memory bank refinement."""
-        all_seg, fg_logits, struct_logits, refined_final = self._iterative_forward(combined, num_iterations)
+        all_seg, fg_logits, struct_logits, refined_final = self._iterative_forward(
+            combined, num_iterations, raw=raw)
         consist_loss = self.consistency_criterion(fg_logits, struct_logits)
         pred_boxes, pred_logits, det_outputs = self._det_forward(refined_final, struct_logits)
         return all_seg, pred_boxes, pred_logits, det_outputs, consist_loss
@@ -933,23 +1182,104 @@ class FusionModel(nn.Module):
         """
         if not self.adapter_banks:
             return torch.tensor(0.0, device=masks.device)
+        target, keep = self._router_target(masks)
+        if target is None:                                 # SD2_ROUTER_TARGET=none
+            return torch.tensor(0.0, device=masks.device)
         losses = []
         for bank in self.adapter_banks:
             logits = bank.last_router_logits  # [B, num_structures]
             if logits is None:
                 continue
-            presence = torch.stack([
-                (masks == c).float().mean(dim=(1, 2)) for c in range(1, self.num_classes)
-            ], dim=1)  # [B, num_structures]
-            target = (presence > 0).float()
             # BCEWithLogits on the router logits (autocast-safe, unlike BCE on
             # the softmax output) pushes present-class logits up and absent
             # classes down, so the softmax distributes weight among present
             # classes exactly.
-            losses.append(F.binary_cross_entropy_with_logits(logits.float(), target))
+            if keep is None:
+                losses.append(F.binary_cross_entropy_with_logits(logits.float(), target))
+            else:
+                # A class present in every training image carries no routing
+                # information: its term is masked out instead of being
+                # "satisfied" by a saturated logit (that is what turned the raw
+                # target into a one-way ratchet).
+                per = F.binary_cross_entropy_with_logits(logits.float(), target,
+                                                        reduction='none')
+                m = keep.expand_as(per)
+                losses.append((per * m).sum() / m.sum().clamp(min=1.0))
         if not losses:
             return torch.tensor(0.0, device=masks.device)
         return torch.stack(losses).mean()
+
+    def _router_target(self, masks):
+        """Presence target for the routers, plus the mask of classes that count.
+
+        'legacy' (default) keeps the raw binary presence vector. It is a one-way
+        ratchet for a class present in every image (adapter 0 = noise): measured
+        saturated (max w = 1.000, entropy 0, constant across all 45 val images) in
+        7/8 banks at 8 banks and 14/32 at 32 banks. SD2_ROUTER_TARGET=norm divides
+        the presence vector by the number of classes present in that image, so no
+        single class can own target=1 -- the shipped counter-measure (with
+        SD2_ROUTER_DROP_ALWAYS, which removes the always-present class instead of
+        asking the router to satisfy it forever). Also note the balance term below
+        only has a zero at a uniform router under the norm target. SD2_ROUTER_DROP_ALWAYS=<rate> additionally masks out the
+        classes whose train presence rate is >= rate (train.py sets
+        model.class_presence).
+        """
+        if self.router_target == 'none':
+            return None, None
+        presence = torch.stack([
+            (masks == c).float().mean(dim=(1, 2)) for c in range(1, self.num_classes)
+        ], dim=1)  # [B, num_structures]
+        target = (presence > 0).float()
+        keep = None
+        if self.router_drop_always > 0 and self.class_presence is not None:
+            # class_presence is indexed by CLASS ID (0 = background), the target
+            # by structure index (0 = class 1): drop the background entry, or the
+            # mask is one wider than the target it multiplies.
+            cp = torch.as_tensor(self.class_presence, device=target.device,
+                                 dtype=target.dtype)[1:]
+            keep = (cp < self.router_drop_always).float().unsqueeze(0)  # [1, K]
+        if self.router_target != 'legacy':
+            target = target / target.sum(dim=1, keepdim=True).clamp(min=1.0)
+        return target, keep
+
+    def router_balance_loss(self, masks):
+        """Switch-style load balance over the structure adapters.
+
+        Minimised when each adapter's mean router weight matches its demand share,
+        so no adapter can be starved while another owns everything; 0 at a uniform
+        utilisation. With SD2_ROUTER_TARGET=none there is no class demand, so the
+        term balances the utilisation against itself (demand := supply): it only
+        penalises a SYSTEMATIC skew across the batch, which is what a collapse is. The previous runs had no such term, so nothing pushed
+        back once the softmax collapsed onto one slot. Weight: SD2_ROUTER_BAL_W.
+        """
+        if not self.adapter_banks:
+            return torch.tensor(0.0, device=masks.device)
+        target, _ = self._router_target(masks)
+        demand = None if target is None else target.mean(dim=0)   # [K] class demand share
+        losses = []
+        for bank in self.adapter_banks:
+            w = bank.last_router_w                         # [B, K]
+            if w is None:
+                continue
+            supply = w.float().mean(dim=0)                 # [K] router supply share
+            # undirected mode (no presence target): balance the utilisation itself
+            d = supply if demand is None else demand
+            losses.append(supply.shape[0] * (d * supply).sum() - 1.0)
+        if not losses:
+            return torch.tensor(0.0, device=masks.device)
+        return torch.stack(losses).mean()
+
+    def _det_only_forward(self, combined):
+        """Detection-only forward: no seg logits, no consistency term.
+
+        Reached when task='det' (no mask GT to train the seg branch with). The
+        seg outputs are None rather than a fabricated all-background map, so a
+        caller cannot mistake them for predictions; consist_loss is a constant
+        zero so the joint loss expression in train.py stays valid unchanged.
+        """
+        pred_boxes, pred_logits, det_outputs = self._det_forward(combined, None)
+        return None, pred_boxes, pred_logits, det_outputs, \
+            torch.zeros((), device=combined.device)
 
     def forward(self, x, return_branch_features=False, num_iterations=None):
         if num_iterations is None:
@@ -969,10 +1299,14 @@ class FusionModel(nn.Module):
 
         combined = torch.cat([feat1, feat_sam], dim=1)
 
-        if num_iterations <= 1:
+        if not self.seg_enabled:
+            out, pred_boxes, pred_logits, det_outputs, consist_loss = \
+                self._det_only_forward(combined)
+        elif num_iterations <= 1:
             out, pred_boxes, pred_logits, det_outputs, consist_loss = self._task_forward(combined)
         else:
-            all_seg, pred_boxes, pred_logits, det_outputs, consist_loss = self._task_forward_iterative(combined, num_iterations)
+            all_seg, pred_boxes, pred_logits, det_outputs, consist_loss = self._task_forward_iterative(
+                combined, num_iterations, raw=x)
             out = all_seg
 
         if return_branch_features:
