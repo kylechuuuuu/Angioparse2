@@ -9,7 +9,9 @@ lightweight **iterative residual refiner**.
 The same codebase supports two tasks:
 
 * **joint** — segmentation (7 classes) + detection; needs the `{split}/masks` directory.
-* **det-only** — the no-mask case: trains and runs with **no masks directory at all**.
+* **det-only** — the no-mask case: trains and runs with **no masks directory at all**. The
+  det-only v2 code (box-supervised dense lesion prior + copy-paste augmentation) lives in
+  [`detonly/`](detonly/README.md); copy its files over this tree to switch variant.
 
 ## Citation
 
@@ -135,10 +137,11 @@ Core runnable code:
 | `calculate_metrics.py` | segmentation evaluation |
 | `detection_metrics.py` | detection evaluation (COCO-style) |
 | `requirements.txt` | Python dependencies |
+| `detonly/` | det-only v2 variant (maskless detection) — see [`detonly/README.md`](detonly/README.md) |
 
 Internal analysis, probing and verification scripts (router saturation, adapter binding,
-refiner diagnosis) and the experimental `detonly/` variant are maintained separately in the
-development tree and are not part of this release.
+refiner diagnosis) are maintained separately in the development tree and are not part of
+this release.
 
 **Code only — no weights ship in this repository.** The pretrained backbone and any trained
 checkpoint are excluded for version control.
